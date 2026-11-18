@@ -11,7 +11,7 @@ Ambiente testado:
 | Xcode | 27.2 (SDK macOS 27.2, clang 21) |
 | Qt | 6.10.3 (o `phoenix.pro` aceita de 6.5.3 a 6.10.10) |
 
-O script [`tools/build_fritzing_mac_arm64.sh`](tools/build_fritzing_mac_arm64.sh) automatiza a compilação do Fritzing e a montagem do `.app` (seções 3 e 4). Com `--install`, ele também instala o app em `/Applications` (seção 4.1).
+O script [`tools/build_fritzing_mac_arm64.sh`](tools/build_fritzing_mac_arm64.sh) automatiza a compilação do Fritzing e a montagem do `.app` (seções 3 e 4). O app gerado é autocontido. Com `--install`, o script também instala o app em `/Applications` (seção 4.1).
 
 ---
 
@@ -164,38 +164,59 @@ O app é gerado em `$WORKSPACE/_build/release64/Fritzing.app`.
 
 Os avisos do linker do tipo `built for newer 'macOS' version (27.0) than being linked (13.0)` são esperados: as dependências foram compiladas com o deployment target padrão da máquina. Não atrapalham a execução local.
 
-## 4. Montando o Fritzing.app
+## 4. Montando o Fritzing.app (autocontido)
+
+O script faz esta etapa logo depois do `make`. O resultado é um `.app` que não depende de `~/Qt` nem de nenhuma pasta de `$WORKSPACE`:
 
 ```bash
-APP="$WORKSPACE/_build/release64/Fritzing.app"; M="$APP/Contents/MacOS"
+APP="$WORKSPACE/_build/release64/Fritzing.app"; M="$APP/Contents/MacOS"; QT=~/Qt/6.10.3/macos
 
 # A libpolyclipping é instalada com install name sem caminho; aponta para o rpath
 install_name_tool -change libpolyclipping.22.dylib @rpath/libpolyclipping.22.dylib "$M/Fritzing"
 
+# Qt (frameworks, plugins, qt.conf), quazip e polyclipping em Contents/Frameworks
+"$QT/bin/macdeployqt" "$APP" \
+  -libpath="$WORKSPACE/quazip-6.10.3-1.4intuisphere/lib" -libpath="$WORKSPACE/Clipper1-6.4.2/lib" -libpath="$QT/lib"
+install_name_tool -id @rpath/libpolyclipping.22.dylib "$APP/Contents/Frameworks/libpolyclipping.22.dylib"
+rm -f "$APP"/Contents/PlugIns/sqldrivers/libqsql{mimer,odbc,psql}.dylib   # só o SQLite é usado
+
+# Remove os rpaths absolutos ($WORKSPACE, ~/Qt); fica só @executable_path/../Frameworks
+otool -l "$M/Fritzing" | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | grep '^/' |
+  while read -r r; do install_name_tool -delete_rpath "$r" "$M/Fritzing"; done
+
 # Simulador: o Fritzing procura a dylib em QCoreApplication::libraryPaths() (inclui Contents/MacOS)
 cp "$WORKSPACE/ngspice-42/lib/libngspice.0.dylib" "$M/"
+install_name_tool -id @rpath/libngspice.0.dylib "$M/libngspice.0.dylib"
 cp -R "$WORKSPACE/ngspice-42/lib/ngspice" "$M/"     # code models (analog.cm etc.)
+
+# Peças, com o .git, em Resources, e um symlink relativo em MacOS
+rsync -a --delete "$WORKSPACE/fritzing-parts/" "$APP/Contents/Resources/fritzing-parts/"
+ln -s ../Resources/fritzing-parts "$M/fritzing-parts"
 
 # Exemplos, ajuda e traduções
 cp -R "$WORKSPACE/fritzing-app/sketches" "$WORKSPACE/fritzing-app/help" "$M/"
 mkdir -p "$M/translations"
 for ts in "$WORKSPACE"/fritzing-app/translations/*.ts; do
-  ~/Qt/6.10.3/macos/bin/lrelease -silent "$ts" -qm "$M/translations/$(basename "${ts%.ts}").qm"
+  "$QT/bin/lrelease" -silent "$ts" -qm "$M/translations/$(basename "${ts%.ts}").qm"
 done
 find "$M/translations" -name "*.qm" -size -128c -delete
 # Realce de sintaxe da janela de código (carrega translations/syntax/styles.xml)
 mkdir -p "$M/translations/syntax"
 cp "$WORKSPACE"/fritzing-app/translations/syntax/*.xml "$M/translations/syntax/"
 
-# Assinatura ad-hoc, obrigatória no Apple Silicon depois de alterar o binário
+# Assinatura ad-hoc, obrigatória no Apple Silicon depois de alterar os binários
 codesign --force --deep -s - "$APP"
-
-open "$APP"
+codesign -v --strict "$APP"
 ```
 
-Sem os arquivos de `translations/syntax`, o log de inicialização mostra `Unable to open …/translations/syntax/styles.xml` e `QDomDocument::setContent: Failed to open device`.
+Observações:
 
-Para ver o log de inicialização, rode `"$M/Fritzing" -debug > fritzing-debug.log 2>&1`. Não passe nenhum argumento depois de `-debug`: o Fritzing usa o argumento seguinte como arquivo de saída do log e sobrescreve esse arquivo (por exemplo, um `.fzz`).
+- **macdeployqt:** ele mostra `ERROR: no file at …libpq…`, `…libiodbc…` e `…libmimerapi…`. Essas mensagens vêm dos drivers SQL de PostgreSQL, ODBC e Mimer, que dependem de bibliotecas inexistentes na máquina. Esses drivers são apagados logo em seguida, porque o Fritzing só usa o `libqsqlite` (banco de peças). Sem `-libpath="$QT/lib"`, o `QtCore5Compat` (exigido pela quazip) não entra no bundle.
+- **ngspice sem o `spinit`:** o Fritzing carrega sozinho o `analog.cm`, que fica ao lado da dylib (`ngspice_simulator.cpp`). O `spinit`, que fica no prefixo de instalação do ngspice, não vai para o bundle. Sem ele, o ngspice só avisa `Note: can't find the initialization file spinit.` e continua. As peças do Fritzing usam modelos nativos (D, BJT, MOS) e o `ilimit` do `analog.cm`. O simulador foi testado assim, com `$WORKSPACE/ngspice-42` e `~/Qt` renomeados: um multímetro medindo 2 pilhas AA marcou 3.000 V.
+- **Peças em `Resources`:** em `Contents/MacOS`, o `codesign` trata o `fritzing-parts/.git` como código aninhado e a assinatura falha (`bundle format unrecognized`). Por isso a pasta fica em `Resources`. O symlink relativo `MacOS/fritzing-parts` é o primeiro lugar onde `FolderUtils::getApplicationSubFolder` procura, e um symlink que aponta para dentro do bundle passa no `codesign -v --strict`.
+- **O `.git` das peças (29 MB) é mantido:** o atualizador de peças (`partschecker.cpp`) faz fetch, merge e reset com a libgit2 nessa pasta, e regenerar o `parts.db` exige o repositório. Quando o Fritzing atualiza as peças, ele escreve dentro do bundle e a assinatura ad-hoc deixa de valer (`codesign -v` falha). O app continua abrindo, porque as peças são recursos e não código, e um novo `--install` reassina.
+- **Arquivos de `translations/syntax`:** sem eles, o log de inicialização mostra `Unable to open …/translations/syntax/styles.xml` e `QDomDocument::setContent: Failed to open device`.
+- **Log de inicialização:** rode `"$M/Fritzing" -debug > fritzing-debug.log 2>&1`. Não passe nenhum argumento depois de `-debug`, porque o Fritzing usa o argumento seguinte como arquivo de saída do log e sobrescreve esse arquivo (por exemplo, um `.fzz`).
 
 ### 4.1 Instalando em /Applications (opcional)
 
@@ -205,23 +226,29 @@ fritzing-app/tools/build_fritzing_mac_arm64.sh --install
 
 Depois de montar o app em `_build/release64`, o script:
 
-1. Apaga um `/Applications/Fritzing.app` anterior, mas só se ele tiver sido instalado pelo próprio script (bundle id `org.fritzing.Fritzing` e o symlink de peças descrito abaixo). Se houver outro Fritzing lá, o script para sem apagar nada.
-2. Copia o app com `ditto`.
-3. Cria o symlink `Contents/MacOS/fritzing-parts -> $WORKSPACE/fritzing-parts`. Fora de `$WORKSPACE`, subir as pastas a partir do executável não encontra as peças. `FolderUtils::getApplicationSubFolder` procura primeiro em `applicationDirPath()/fritzing-parts`.
-4. Reassina com `codesign --force --deep -s -`.
+1. Apaga um `/Applications/Fritzing.app` anterior, mas só se ele tiver sido instalado pelo próprio script. A checagem exige o bundle id `org.fritzing.Fritzing` e o marcador `Contents/Resources/.fritzing-local-build` (ou o symlink `fritzing-parts` das versões anteriores do script). Se houver outro Fritzing lá, o script para sem apagar nada.
+2. Copia o app com `ditto` e reassina, conferindo com `codesign -v --strict`.
+3. Registra o app no LaunchServices: `lsregister -u` na cópia do `_build` e `lsregister -f` na de `/Applications`. Sem isso, `open -a Fritzing`, o Launchpad e o Spotlight podem abrir a cópia do `_build`. O aviso `failed to scan … -10814` do `-u` aparece quando a cópia do `_build` não estava registrada e é inofensivo.
 
 O script não usa `sudo`. Se a pasta `/Applications` não puder ser gravada pelo usuário, a cópia falha.
 
-O app instalado **não é autocontido**. Ele continua dependendo de `$WORKSPACE`, que guarda a quazip e o Clipper (via rpath), o `ngspice-42` (caminho gravado na `libngspice`) e o `fritzing-parts` (via symlink). Também depende de `~/Qt/6.10.3`. Se alguma dessas pastas for movida ou apagada, o app instalado deixa de funcionar.
+O app instalado é autocontido. Para validar:
+
+```bash
+codesign -v --strict /Applications/Fritzing.app
+# nenhum Mach-O do bundle deve referenciar /Users/ ou ~/Qt
+find /Applications/Fritzing.app -type f -print0 | xargs -0 file | grep Mach-O
+# todas as libs carregadas devem vir do bundle, de /System ou de /usr/lib
+DYLD_PRINT_LIBRARIES=1 /Applications/Fritzing.app/Contents/MacOS/Fritzing 2>&1 | grep -v -e /Applications/Fritzing.app -e /System/ -e /usr/lib/
+```
 
 ## 5. Limitações conhecidas
 
-- **Só para uso local.** O app gerado roda apenas em arm64 e linka as dependências por caminho absoluto (rpath para `$WORKSPACE` e `~/Qt`). Distribuir exigiria `macdeployqt`, copiar as dylibs para dentro do bundle, assinar com Developer ID e notarizar.
+- **Só para uso local.** O app gerado roda apenas em arm64 e tem assinatura ad-hoc. Distribuir exigiria assinar com Developer ID e notarizar. Para recompilar, as dependências em `$WORKSPACE` e o `~/Qt` continuam necessários.
 - O `tools/deploy_fritzing_mac.sh` original está desatualizado (Qt 5 em `/usr/local`).
 - Na primeira execução (`Fritzing -debug`), enquanto o banco de peças é montado, até 5 peças obsoletas referenciadas pelo bin "Core Parts" podem gerar `SQLITE: couldn't insert part … Parameter count mismatch`. Não impedem o uso.
-- **A `libngspice` depende de `$WORKSPACE/ngspice-42` em runtime.** O ngspice grava o prefixo de instalação (`$WORKSPACE/ngspice-42/bin` e `.../share/ngspice`, onde fica o `spinit`). Copiar a dylib para dentro do bundle não remove essa dependência. Se o ngspice for movido, ele precisa ser recompilado com o novo `--prefix` (seção 2.6).
+- A `libngspice` guarda o prefixo de instalação (`$WORKSPACE/ngspice-42/bin` e `.../share/ngspice`). Dentro do bundle, esse caminho só é usado para procurar o `spinit`, que é opcional (veja a seção 4).
 - O binário do Fritzing contém caminhos do tipo `…/_src/libgit2-1.7.1/src/…`. Eles vêm dos `__FILE__` da `libgit2.a` estática e registram onde ela foi compilada. São usados apenas em mensagens internas e não afetam a execução, então não é preciso recompilar a libgit2 depois de mover o `$WORKSPACE`.
-- O simulador (ngspice) foi compilado e empacotado, mas ainda não foi testado com o app rodando.
 
 ## 6. Docker / cross-compilação
 
